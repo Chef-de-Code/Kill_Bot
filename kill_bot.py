@@ -3077,6 +3077,140 @@ async def uptime(interaction: discord.Interaction):
     log_event(f"/uptime used by {interaction.user}: {format_uptime(uptime_seconds)}")
 
 
+
+# -----------------------------
+# /rslookup
+# -----------------------------
+def _format_int(value, default: str = "Unknown") -> str:
+    try:
+        if value is None or value == "":
+            return default
+        return f"{int(value):,}"
+    except Exception:
+        return str(value) if value is not None else default
+
+
+def _rs_profile_url(rsn: str) -> str:
+    return f"https://apps.runescape.com/runemetrics/app/overview/player/{urllib.parse.quote(rsn)}"
+
+
+def _skills_from_profile(profile: Dict) -> List[tuple[str, int, int]]:
+    skills: List[tuple[str, int, int]] = []
+    skillvalues = profile.get("skillvalues")
+    if not isinstance(skillvalues, list):
+        return skills
+
+    for item in skillvalues:
+        if not isinstance(item, dict):
+            continue
+        try:
+            skill_id = int(item.get("id"))
+            skill_name = SKILL_ID_TO_NAME.get(skill_id, f"Skill {skill_id}")
+            level = int(item.get("level", 0) or 0)
+            xp = int(item.get("xp", 0) or 0)
+            skills.append((skill_name, level, xp))
+        except Exception:
+            continue
+    return skills
+
+
+def _skill_column_lines(skills: List[tuple[str, int, int]], start: int, end: int) -> str:
+    chunk = skills[start:end]
+    if not chunk:
+        return "*No data*"
+    return "\n".join(f"**{name}:** {level} — {xp:,} XP" for name, level, xp in chunk)
+
+
+@client.tree.command(name="rslookup", description="Look up a RuneScape player's public RuneMetrics profile.")
+@app_commands.describe(rsn="RuneScape display name to look up")
+async def rslookup(interaction: discord.Interaction, rsn: str):
+    log_event(f"/rslookup used by {interaction.user}: {rsn}")
+    await interaction.response.defer()
+
+    profile = await fetch_runemetrics_profile(rsn)
+    if not profile:
+        await interaction.followup.send(
+            f"I could not read public RuneMetrics data for **{rsn}**. The profile may be private, unavailable, or the name may be incorrect.",
+            ephemeral=True,
+        )
+        return
+
+    display_name = str(profile.get("name") or rsn).strip()
+    combat = profile.get("combatlevel", "Unknown")
+    total_level = profile.get("totalskill", "Unknown")
+    total_xp = _format_int(profile.get("totalxp", 0))
+    quests_complete = profile.get("questscomplete")
+    quest_points = profile.get("questpoints") or profile.get("quest_points")
+
+    description_bits = [
+        "A public RuneMetrics snapshot from the Adventurer's Log.",
+        f"[Open RuneMetrics profile]({_rs_profile_url(display_name)})",
+    ]
+
+    embed = discord.Embed(
+        title=f"📜 RuneScape Profile — {display_name}",
+        description="\n".join(description_bits),
+        url=_rs_profile_url(display_name),
+        color=discord.Color.gold(),
+    )
+
+    embed.add_field(name="⚔️ Combat", value=str(combat), inline=True)
+    embed.add_field(name="📊 Total Level", value=str(total_level), inline=True)
+    embed.add_field(name="✨ Total XP", value=total_xp, inline=True)
+
+    quest_value_parts = []
+    if quests_complete not in (None, ""):
+        quest_value_parts.append(f"Completed: **{_format_int(quests_complete)}**")
+    if quest_points not in (None, ""):
+        quest_value_parts.append(f"Quest points: **{_format_int(quest_points)}**")
+    embed.add_field(
+        name="📚 Quests",
+        value="\n".join(quest_value_parts) if quest_value_parts else "Not exposed by public RuneMetrics",
+        inline=True,
+    )
+
+    skills = _skills_from_profile(profile)
+    if skills:
+        skills_by_level = sorted(skills, key=lambda item: (item[1], item[2]), reverse=True)
+        top_5 = skills_by_level[:5]
+        embed.add_field(
+            name="🏆 Top Skills",
+            value="\n".join(f"**{name}** — {level} ({xp:,} XP)" for name, level, xp in top_5),
+            inline=False,
+        )
+
+        skills_alpha = sorted(skills, key=lambda item: item[0])
+        embed.add_field(name="📘 Skills A-H", value=_skill_column_lines(skills_alpha, 0, 10), inline=True)
+        embed.add_field(name="📗 Skills I-R", value=_skill_column_lines(skills_alpha, 10, 20), inline=True)
+        embed.add_field(name="📙 Skills S-Z", value=_skill_column_lines(skills_alpha, 20, 30), inline=True)
+
+    activities = profile.get("activities")
+    if isinstance(activities, list) and activities:
+        recent_lines = []
+        for activity in activities[:6]:
+            if not isinstance(activity, dict):
+                continue
+            text = str(activity.get("text", "")).strip()
+            date = str(activity.get("date", "")).strip()
+            if not text:
+                continue
+            line = f"• {text}"
+            if date:
+                line += f" — *{date}*"
+            if len(line) > 190:
+                line = line[:187].rstrip() + "..."
+            recent_lines.append(line)
+        if recent_lines:
+            embed.add_field(name="📖 Recent Adventurer Log", value="\n".join(recent_lines), inline=False)
+
+    thumb = bot_thumbnail_url(interaction)
+    if thumb:
+        embed.set_thumbnail(url=thumb)
+    embed.set_footer(text="Data from public RuneMetrics. Private profiles may not show all data.")
+
+    await interaction.followup.send(embed=embed)
+
+
 # -----------------------------
 # /lookup
 # -----------------------------
