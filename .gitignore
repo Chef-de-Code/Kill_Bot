@@ -17,6 +17,10 @@ reminders.json
 rank_data.json
 rsn_tracking.json
 signup_sessions.json
+host_sessions.json
+
+# Local launcher
+run_killbot_auto_update.bat
 
 # Logs
 *.log
