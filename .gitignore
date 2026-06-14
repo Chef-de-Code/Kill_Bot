@@ -1,0 +1,22 @@
+# Discord token
+.env
+
+# Python cache
+__pycache__/
+*.pyc
+
+# VS Code settings
+.vscode/
+
+# Runtime data
+pk_data.json
+kgp_data.json
+teampenguin.json
+pvm_polls.json
+reminders.json
+rank_data.json
+rsn_tracking.json
+signup_sessions.json
+
+# Logs
+*.log
