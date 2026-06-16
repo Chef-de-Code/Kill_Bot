@@ -8,6 +8,7 @@
 # - /pvmtonight + /gotime: private PVM availability poll + collated eligible boss picker + signup sheet
 # - /blameuser: blame any selected user with KGP-approved nonsense
 # - /remindme: persistent user reminder command
+# - /updatebot: staff restart command for GitHub pull via launcher
 # - /rsassign: staff assign RSNs to Discord users for tracking
 # - /kbcommands: help command listing formats
 # - /rank + /rankboard + /rankadmin: activity points and earnable rank progression
@@ -3078,6 +3079,44 @@ async def uptime(interaction: discord.Interaction):
 
 
 
+async def _restart_bot_after_response(delay_seconds: int = 3):
+    """Close the Discord client and exit Python.
+
+    If PC2 is running via run_killbot_auto_update.bat, the batch file will then
+    perform git pull and start Kill Bot again.
+    """
+    await asyncio.sleep(delay_seconds)
+    log_event("/updatebot restarting Kill Bot process now. The launcher should git pull and restart it.")
+    try:
+        await client.close()
+    finally:
+        os._exit(0)
+
+
+@client.tree.command(name="updatebot", description="Staff only: restart Kill Bot so the host launcher can pull GitHub updates.")
+async def updatebot(interaction: discord.Interaction):
+    if not isinstance(interaction.user, discord.Member) or not can_manage_killbot(interaction.user):
+        await interaction.response.send_message("Nay. Only an Ice Marshall or Emperor Penguin may update Kill Bot.", ephemeral=True)
+        return
+
+    embed = discord.Embed(
+        title="🔄 Kill Bot Update Requested",
+        description=(
+            f"Update requested by {interaction.user.mention}.\n\n"
+            "Kill Bot will restart in a few seconds. If the host is running via "
+            "`run_killbot_auto_update.bat`, it will check GitHub, pull any updates, and come back online."
+        ),
+        color=discord.Color.gold(),
+    )
+    thumb = bot_thumbnail_url(interaction)
+    if thumb:
+        embed.set_thumbnail(url=thumb)
+
+    await interaction.response.send_message(embed=embed, allowed_mentions=discord.AllowedMentions(users=True))
+    log_event(f"/updatebot used by {interaction.user} ({interaction.user.id}). Restart scheduled.")
+    asyncio.create_task(_restart_bot_after_response())
+
+
 # -----------------------------
 # /rslookup
 # -----------------------------
@@ -3351,6 +3390,16 @@ async def kbcommands(interaction: discord.Interaction):
     embed.add_field(
         name="⏱️ /uptime",
         value="Show how long Kill Bot has been online since the last restart.\n**Type:** `/uptime`",
+        inline=False,
+    )
+
+    embed.add_field(
+        name="🔄 /updatebot",
+        value=(
+            "Staff only: restart Kill Bot so the host launcher can pull the latest GitHub version.\n"
+            "**Type:** `/updatebot`\n"
+            "**Requires:** PC2 must be running via `run_killbot_auto_update.bat`."
+        ),
         inline=False,
     )
 
