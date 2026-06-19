@@ -20,7 +20,7 @@ import asyncio
 import urllib.parse
 import re
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Any, Tuple
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -390,6 +390,14 @@ SKILL_LEVEL_XP_MILESTONES = {99: 13_034_431, 110: 38_737_661, 120: 104_273_167} 
 PERMANENT_ACHIEVEMENT_CHANNEL_NAME = "kill-bot-achievements"
 HTTP_SESSION: Optional[aiohttp.ClientSession] = None
 
+# Long-term RuneMetrics snapshots for /gains. This is forward-looking: it starts
+# tracking from the moment this version runs and improves over time.
+RSN_HISTORY_FILE = Path(__file__).with_name("rsn_history.json")
+RSN_HISTORY: Dict[int, List[Dict[str, Any]]] = {}
+RSN_HISTORY_MAX_DAYS = 370
+GE_SEARCH_CACHE: Dict[str, Dict[str, Any]] = {}
+
+
 # RuneMetrics skillvalue IDs. If Jagex adds a new skill, add it here.
 SKILL_ID_TO_NAME = {
     0: "Attack",
@@ -506,6 +514,41 @@ LOW_VALUE_DROP_ITEMS = {
     "warrior ring",
 }
 
+# Staff-managed low-value/drop suppression entries live outside Git so each host can tune them safely.
+CUSTOM_LOW_VALUE_DROP_FILE = Path(__file__).with_name("custom_low_value_drops.json")
+CUSTOM_LOW_VALUE_DROP_ITEMS: set[str] = set()
+
+
+def normalise_drop_item_name(item: str) -> str:
+    return " ".join(str(item).lower().replace("’", "'").replace("triselion", "triskelion").strip(" .").split())
+
+
+# Normalise the static table once so matching is consistent.
+LOW_VALUE_DROP_ITEMS = {normalise_drop_item_name(item) for item in LOW_VALUE_DROP_ITEMS}
+
+
+def custom_low_value_load():
+    global CUSTOM_LOW_VALUE_DROP_ITEMS
+    if not CUSTOM_LOW_VALUE_DROP_FILE.exists():
+        CUSTOM_LOW_VALUE_DROP_ITEMS = set()
+        return
+    try:
+        data = json.loads(CUSTOM_LOW_VALUE_DROP_FILE.read_text(encoding="utf-8"))
+        CUSTOM_LOW_VALUE_DROP_ITEMS = {normalise_drop_item_name(x) for x in data.get("items", []) if str(x).strip()}
+        log_event(f"Loaded {len(CUSTOM_LOW_VALUE_DROP_ITEMS)} custom ignored drop item(s).")
+    except Exception as e:
+        CUSTOM_LOW_VALUE_DROP_ITEMS = set()
+        log_event(f"Failed to load custom ignored drops: {e}")
+
+
+def custom_low_value_save():
+    data = {"items": sorted(CUSTOM_LOW_VALUE_DROP_ITEMS)}
+    CUSTOM_LOW_VALUE_DROP_FILE.write_text(json.dumps(data, indent=2), encoding="utf-8")
+
+
+def all_low_value_drop_items() -> set[str]:
+    return LOW_VALUE_DROP_ITEMS | CUSTOM_LOW_VALUE_DROP_ITEMS
+
 # RuneMetrics activity text allow-list. This keeps #kill-bot-achievements focused on worthwhile logs.
 # Add future approved activity formats here. Use lower-case regex patterns.
 ALLOWED_RUNEMETRICS_PATTERNS = [
@@ -515,6 +558,9 @@ ALLOWED_RUNEMETRICS_PATTERNS = [
     r".*dig ?site.*(complete|completed|fully excavated|finished|restored|restoring|uncovered|discovered|qualification|qualified).*$",
     r".*completed.*dig ?site.*$",
     r".*completed.*archaeology.*collection.*$",
+    r".*archaeology.*(collection|collector|artefact|artifact|qualification|qualified|dig ?site|excavation|restored|restoration|mystery|monolith|relic).*$",
+    r".*(associate|professor|guildmaster|intern|assistant|associate professor).*qualification.*$",
+    r".*(completed|finished|uncovered|discovered|restored|excavated).*dig ?site.*$",
     r"^i now have a total level of \d+",
     r"^\d{1,3}(?:,\d{3})*xp in .+",
     r"^i now have at least \d{1,3}(?:,\d{3})* experience points in the .+ skill",
@@ -606,6 +652,64 @@ def rsn_save():
         "achievement_channels": {str(k): v for k, v in RSN_ACHIEVEMENT_CHANNELS.items()},
     }
     RSN_DATA_FILE.write_text(json.dumps(data, indent=2), encoding="utf-8")
+
+
+def rsn_history_load():
+    global RSN_HISTORY
+    if not RSN_HISTORY_FILE.exists():
+        RSN_HISTORY = {}
+        return
+    try:
+        raw = json.loads(RSN_HISTORY_FILE.read_text(encoding="utf-8"))
+        RSN_HISTORY = {int(uid): list(entries) for uid, entries in raw.items()}
+        log_event(f"Loaded RuneMetrics gains history for {len(RSN_HISTORY)} user(s).")
+    except Exception as e:
+        log_event(f"Failed to load RuneMetrics gains history: {e}")
+        RSN_HISTORY = {}
+
+
+def rsn_history_save():
+    serial = {str(uid): entries for uid, entries in RSN_HISTORY.items()}
+    RSN_HISTORY_FILE.write_text(json.dumps(serial, indent=2), encoding="utf-8")
+
+
+def record_rsn_history_snapshot(user_id: int, snapshot: Dict[str, Any]):
+    now = now_unix_utc()
+    entries = RSN_HISTORY.setdefault(user_id, [])
+    # Avoid writing effectively identical snapshots every few seconds if a forced check happens.
+    if entries and now - int(entries[-1].get("ts", 0)) < 240:
+        entries[-1] = {"ts": now, "snapshot": snapshot}
+    else:
+        entries.append({"ts": now, "snapshot": snapshot})
+
+    cutoff = now - RSN_HISTORY_MAX_DAYS * 86400
+    RSN_HISTORY[user_id] = [entry for entry in entries if int(entry.get("ts", 0)) >= cutoff]
+    rsn_history_save()
+
+
+def get_history_baseline(user_id: int, seconds_back: int) -> Optional[Dict[str, Any]]:
+    entries = RSN_HISTORY.get(user_id, [])
+    if not entries:
+        return None
+    target = now_unix_utc() - seconds_back
+    older = [entry for entry in entries if int(entry.get("ts", 0)) <= target]
+    if older:
+        return max(older, key=lambda entry: int(entry.get("ts", 0)))
+    return min(entries, key=lambda entry: abs(int(entry.get("ts", 0)) - target))
+
+
+def period_to_seconds(period: str) -> Optional[int]:
+    lookup = {
+        "day": 86400,
+        "daily": 86400,
+        "week": 7 * 86400,
+        "weekly": 7 * 86400,
+        "month": 30 * 86400,
+        "monthly": 30 * 86400,
+        "year": 365 * 86400,
+        "yearly": 365 * 86400,
+    }
+    return lookup.get(period.lower().strip())
 
 
 def user_display_for_rsn(user_id: int) -> str:
@@ -705,10 +809,11 @@ def contains_low_value_drop(text: str) -> bool:
 
     # Prefer exact item matching where possible.
     if extracted:
-        return extracted in LOW_VALUE_DROP_ITEMS
+        return normalise_drop_item_name(extracted) in all_low_value_drop_items()
 
     # Fallback: substring matching for awkward RuneMetrics phrasing.
-    return any(item in lowered for item in LOW_VALUE_DROP_ITEMS)
+    haystack = normalise_drop_item_name(lowered)
+    return any(item in haystack for item in all_low_value_drop_items())
 
 
 def is_generic_drop_activity(text: str) -> bool:
@@ -969,6 +1074,7 @@ async def run_startup_achievement_catchup(client: discord.Client):
 
             previous_keys = RSN_LAST_ACTIVITY_KEYS.get(user_id)
             current_snapshot = profile_snapshot(profile)
+            record_rsn_history_snapshot(user_id, current_snapshot)
             previous_snapshot = RSN_PROFILE_BASELINES.get(user_id)
 
             # If this is the first time seeing this RSN on this machine/file, create baseline only.
@@ -1024,6 +1130,7 @@ async def achievement_poll_loop(client: discord.Client):
                 current_keys = [runemetrics_activity_key(a) for a in activities if isinstance(a, dict) and a.get("text")]
                 previous_keys = RSN_LAST_ACTIVITY_KEYS.get(user_id)
                 current_snapshot = profile_snapshot(profile)
+                record_rsn_history_snapshot(user_id, current_snapshot)
                 previous_snapshot = RSN_PROFILE_BASELINES.get(user_id)
 
                 # First run after registration or after upgrading code: baseline only, don't spam old data.
@@ -2188,6 +2295,7 @@ async def on_ready():
     rank_load()
     reminders_load()
     rsn_load()
+    custom_low_value_load()
     ensure_permanent_achievement_channels(client)
 
     global INCIDENT_LOG_WORKER_STARTED
@@ -3034,6 +3142,224 @@ async def rschecknow(interaction: discord.Interaction):
 
 
 
+
+# -----------------------------
+# Admin Dashboard / Runtime Drop Suppression
+# -----------------------------
+def build_admin_dashboard_embed(interaction: discord.Interaction) -> discord.Embed:
+    uptime_seconds = now_unix_utc() - BOT_START_UNIX
+    embed = discord.Embed(
+        title="🛠️ Kill Bot Administrator Dashboard",
+        description=(
+            "Operational controls for Ice Marshalls and Emperor Penguins.\n\n"
+            "Use the buttons below to restart/update, check health, and manage the local drop suppression list."
+        ),
+        color=discord.Color.dark_gold(),
+    )
+    embed.add_field(name="Status", value=f"Online for **{format_uptime(uptime_seconds)}**", inline=True)
+    embed.add_field(name="WebSocket", value=f"**{round(client.latency * 1000)}ms**", inline=True)
+    embed.add_field(name="Tracked RSNs", value=str(len(RSN_REGISTRATIONS)), inline=True)
+    embed.add_field(name="Static ignored drops", value=str(len(LOW_VALUE_DROP_ITEMS)), inline=True)
+    embed.add_field(name="Custom ignored drops", value=str(len(CUSTOM_LOW_VALUE_DROP_ITEMS)), inline=True)
+    embed.add_field(name="Achievement channel", value=f"#{PERMANENT_ACHIEVEMENT_CHANNEL_NAME}", inline=True)
+    embed.add_field(
+        name="Useful commands",
+        value=(
+            "`/updatebot` — restart and let the launcher pull GitHub updates\n"
+            "`/ignoredrop action:add item:<item>` — suppress a future broadcast\n"
+            "`/ignoredrop action:remove item:<item>` — remove a custom suppression\n"
+            "`/rschecknow` — force a RuneMetrics check for yourself"
+        ),
+        inline=False,
+    )
+    thumb = bot_thumbnail_url(interaction)
+    if thumb:
+        embed.set_thumbnail(url=thumb)
+    embed.set_footer(text="KGP Administration • Do not feed the bot after midnight")
+    return embed
+
+
+class IgnoredDropModal(discord.ui.Modal):
+    def __init__(self, action: str):
+        title = "Add ignored drop" if action == "add" else "Remove ignored drop"
+        super().__init__(title=title)
+        self.action = action
+        self.item = discord.ui.TextInput(
+            label="Drop/item name",
+            placeholder="Example: shield left half",
+            required=True,
+            max_length=120,
+        )
+        self.add_item(self.item)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if not isinstance(interaction.user, discord.Member) or not can_manage_killbot(interaction.user):
+            await interaction.response.send_message("Nay. Thou lackest dashboard authority.", ephemeral=True)
+            return
+
+        item = normalise_drop_item_name(str(self.item.value))
+        if not item:
+            await interaction.response.send_message("No item name supplied.", ephemeral=True)
+            return
+
+        if self.action == "add":
+            CUSTOM_LOW_VALUE_DROP_ITEMS.add(item)
+            custom_low_value_save()
+            log_event(f"Admin dashboard: {interaction.user} added custom ignored drop '{item}'.")
+            await interaction.response.send_message(f"✅ Added **{item}** to the custom ignored drop list.", ephemeral=True)
+        else:
+            if item in CUSTOM_LOW_VALUE_DROP_ITEMS:
+                CUSTOM_LOW_VALUE_DROP_ITEMS.remove(item)
+                custom_low_value_save()
+                log_event(f"Admin dashboard: {interaction.user} removed custom ignored drop '{item}'.")
+                await interaction.response.send_message(f"✅ Removed **{item}** from the custom ignored drop list.", ephemeral=True)
+            elif item in LOW_VALUE_DROP_ITEMS:
+                await interaction.response.send_message(
+                    f"**{item}** is part of the built-in ignored drop list, so it cannot be removed from Discord. Edit the code if you truly want it broadcast.",
+                    ephemeral=True,
+                )
+            else:
+                await interaction.response.send_message(f"**{item}** was not in the custom ignored drop list.", ephemeral=True)
+
+
+class AdminDashboardView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=300)
+
+    async def _guard(self, interaction: discord.Interaction) -> bool:
+        if not isinstance(interaction.user, discord.Member) or not can_manage_killbot(interaction.user):
+            await interaction.response.send_message("Nay. Only Ice Marshalls and Emperor Penguins may use this dashboard.", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label="Ping", emoji="🏓", style=discord.ButtonStyle.secondary)
+    async def ping_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await self._guard(interaction):
+            return
+        await interaction.response.send_message(
+            f"🏓 Pong. WebSocket latency: **{round(client.latency * 1000)}ms**.",
+            ephemeral=True,
+        )
+
+    @discord.ui.button(label="Uptime", emoji="⏱️", style=discord.ButtonStyle.secondary)
+    async def uptime_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await self._guard(interaction):
+            return
+        uptime_seconds = now_unix_utc() - BOT_START_UNIX
+        await interaction.response.send_message(
+            f"⏱️ Kill Bot has been online for **{format_uptime(uptime_seconds)}**.",
+            ephemeral=True,
+        )
+
+    @discord.ui.button(label="List ignored drops", emoji="📋", style=discord.ButtonStyle.secondary)
+    async def list_ignored_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await self._guard(interaction):
+            return
+        custom = sorted(CUSTOM_LOW_VALUE_DROP_ITEMS)
+        if not custom:
+            await interaction.response.send_message("No custom ignored drops yet. Built-in list is active in code.", ephemeral=True)
+            return
+        shown = custom[:60]
+        more = len(custom) - len(shown)
+        text = "\n".join(f"• {x}" for x in shown)
+        if more > 0:
+            text += f"\n…and {more} more."
+        await interaction.response.send_message(f"📋 **Custom ignored drops:**\n{text}", ephemeral=True)
+
+    @discord.ui.button(label="Add ignored drop", emoji="➕", style=discord.ButtonStyle.success)
+    async def add_ignored_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not isinstance(interaction.user, discord.Member) or not can_manage_killbot(interaction.user):
+            await interaction.response.send_message("Nay. Thou lackest dashboard authority.", ephemeral=True)
+            return
+        await interaction.response.send_modal(IgnoredDropModal("add"))
+
+    @discord.ui.button(label="Remove ignored drop", emoji="➖", style=discord.ButtonStyle.danger)
+    async def remove_ignored_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not isinstance(interaction.user, discord.Member) or not can_manage_killbot(interaction.user):
+            await interaction.response.send_message("Nay. Thou lackest dashboard authority.", ephemeral=True)
+            return
+        await interaction.response.send_modal(IgnoredDropModal("remove"))
+
+    @discord.ui.button(label="Restart / Update", emoji="🔄", style=discord.ButtonStyle.primary)
+    async def restart_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await self._guard(interaction):
+            return
+        await interaction.response.send_message(
+            "🔄 Restart requested. If the host is running the auto-update launcher, it will pull GitHub updates and relaunch.",
+            ephemeral=True,
+        )
+        log_event(f"Admin dashboard restart used by {interaction.user} ({interaction.user.id}).")
+        asyncio.create_task(_restart_bot_after_response())
+
+
+@client.tree.command(name="admindashboard", description="Staff only: open the Kill Bot administrator dashboard.")
+async def admindashboard(interaction: discord.Interaction):
+    if not isinstance(interaction.user, discord.Member) or not can_manage_killbot(interaction.user):
+        await interaction.response.send_message("Nay. Only Ice Marshalls and Emperor Penguins may open the admin dashboard.", ephemeral=True)
+        return
+    await interaction.response.send_message(embed=build_admin_dashboard_embed(interaction), view=AdminDashboardView(), ephemeral=True)
+    log_event(f"/admindashboard opened by {interaction.user} ({interaction.user.id}).")
+
+
+@client.tree.command(name="ignoredrop", description="Staff only: add, remove, or list drops that should not broadcast.")
+@app_commands.describe(action="add/remove/list", item="Drop or item name, e.g. shield left half")
+@app_commands.choices(action=[
+    app_commands.Choice(name="add", value="add"),
+    app_commands.Choice(name="remove", value="remove"),
+    app_commands.Choice(name="list", value="list"),
+])
+async def ignoredrop(interaction: discord.Interaction, action: app_commands.Choice[str], item: Optional[str] = None):
+    if not isinstance(interaction.user, discord.Member) or not can_manage_killbot(interaction.user):
+        await interaction.response.send_message("Nay. Only Ice Marshalls and Emperor Penguins may manage ignored drops.", ephemeral=True)
+        return
+
+    if action.value == "list":
+        custom = sorted(CUSTOM_LOW_VALUE_DROP_ITEMS)
+        built_in_count = len(LOW_VALUE_DROP_ITEMS)
+        if not custom:
+            await interaction.response.send_message(
+                f"📋 No custom ignored drops. Built-in ignored drop list contains **{built_in_count}** item(s).",
+                ephemeral=True,
+            )
+            return
+        shown = custom[:80]
+        more = len(custom) - len(shown)
+        text = "\n".join(f"• {x}" for x in shown)
+        if more > 0:
+            text += f"\n…and {more} more."
+        await interaction.response.send_message(
+            f"📋 Built-in ignored drops: **{built_in_count}**\nCustom ignored drops:\n{text}",
+            ephemeral=True,
+        )
+        return
+
+    if not item:
+        await interaction.response.send_message("Provide an item name for add/remove.", ephemeral=True)
+        return
+
+    clean = normalise_drop_item_name(item)
+    if action.value == "add":
+        CUSTOM_LOW_VALUE_DROP_ITEMS.add(clean)
+        custom_low_value_save()
+        log_event(f"/ignoredrop add used by {interaction.user}: {clean}")
+        await interaction.response.send_message(f"✅ Added **{clean}** to custom ignored drops.", ephemeral=True)
+        return
+
+    if action.value == "remove":
+        if clean in CUSTOM_LOW_VALUE_DROP_ITEMS:
+            CUSTOM_LOW_VALUE_DROP_ITEMS.remove(clean)
+            custom_low_value_save()
+            log_event(f"/ignoredrop remove used by {interaction.user}: {clean}")
+            await interaction.response.send_message(f"✅ Removed **{clean}** from custom ignored drops.", ephemeral=True)
+        elif clean in LOW_VALUE_DROP_ITEMS:
+            await interaction.response.send_message(
+                f"**{clean}** is built into the code-level ignored drop list and cannot be removed with this command.",
+                ephemeral=True,
+            )
+        else:
+            await interaction.response.send_message(f"**{clean}** is not currently custom-ignored.", ephemeral=True)
+
+
 @client.tree.command(name="ping", description="Check whether Kill Bot is online and responding.")
 async def ping(interaction: discord.Interaction):
     started = now_unix_utc()
@@ -3116,6 +3442,343 @@ async def updatebot(interaction: discord.Interaction):
     log_event(f"/updatebot used by {interaction.user} ({interaction.user.id}). Restart scheduled.")
     asyncio.create_task(_restart_bot_after_response())
 
+
+
+# -----------------------------
+# RuneScape Player Tools: /gains, /alog, /ge, /price, /wsid
+# -----------------------------
+def _skill_rows_from_snapshot(snapshot: Dict[str, Any]) -> List[Tuple[str, int, int]]:
+    skills = snapshot.get("skills", {}) if isinstance(snapshot.get("skills"), dict) else {}
+    rows: List[Tuple[str, int, int]] = []
+    for skill_name, data in skills.items():
+        try:
+            rows.append((skill_name, int(data.get("level", 0) or 0), int(data.get("xp", 0) or 0)))
+        except Exception:
+            continue
+    return rows
+
+
+def build_gains_embed(member: discord.Member | discord.User, rsn: str, period: str, old_snapshot: Dict[str, Any], new_snapshot: Dict[str, Any], baseline_ts: int) -> discord.Embed:
+    old_total = int(old_snapshot.get("totalxp", 0) or 0)
+    new_total = int(new_snapshot.get("totalxp", 0) or 0)
+    total_gain = max(0, new_total - old_total)
+
+    old_skills = old_snapshot.get("skills", {}) if isinstance(old_snapshot.get("skills"), dict) else {}
+    new_skills = new_snapshot.get("skills", {}) if isinstance(new_snapshot.get("skills"), dict) else {}
+    skill_gains: List[Tuple[str, int, int, int]] = []
+    for skill_name, new_data in new_skills.items():
+        old_data = old_skills.get(skill_name, {})
+        old_xp = int(old_data.get("xp", 0) or 0)
+        new_xp = int(new_data.get("xp", 0) or 0)
+        gain = new_xp - old_xp
+        if gain > 0:
+            skill_gains.append((skill_name, gain, int(new_data.get("level", 0) or 0), new_xp))
+
+    skill_gains.sort(key=lambda row: row[1], reverse=True)
+    title_period = period.lower().strip().capitalize()
+    embed = discord.Embed(
+        title=f"📈 {title_period} Gains — {rsn}",
+        description=(
+            f"**Player:** {member.mention}\n"
+            f"**Tracked since:** <t:{baseline_ts}:R>\n"
+            f"**Total XP gained:** **{total_gain:,}**"
+        ),
+        color=discord.Color.green(),
+    )
+
+    if skill_gains:
+        embed.add_field(
+            name="Top Skill Gains",
+            value="\n".join(f"• **{name}** — +{gain:,} XP (Lvl {level})" for name, gain, level, _ in skill_gains[:10]),
+            inline=False,
+        )
+    else:
+        embed.add_field(name="Top Skill Gains", value="No XP gains recorded for this period yet.", inline=False)
+
+    embed.set_footer(text="Gains are tracked from Kill Bot snapshots. Accuracy improves the longer the bot has been online.")
+    return embed
+
+
+async def ge_itemdb_search(item_name: str) -> Optional[Dict[str, Any]]:
+    """Best-effort official RuneScape GE lookup.
+
+    The official itemdb API does not provide a clean global name-search endpoint, so this
+    scans catalogue pages by first letter and caches results. This is intentionally RS3-only
+    for now; the command structure leaves room for OSRS providers later.
+    """
+    query = item_name.strip().lower()
+    if not query:
+        return None
+    if query in GE_SEARCH_CACHE:
+        return GE_SEARCH_CACHE[query]
+
+    session = await get_http_session()
+    alpha = urllib.parse.quote(query[0])
+    best: Optional[Dict[str, Any]] = None
+
+    # RS3 item categories are numbered; scanning all is slower but reliable enough for an on-demand command.
+    for category in range(0, 42):
+        for page in range(1, 8):
+            url = f"https://secure.runescape.com/m=itemdb_rs/api/catalogue/items.json?category={category}&alpha={alpha}&page={page}"
+            try:
+                async with session.get(url) as response:
+                    if response.status != 200:
+                        break
+                    data = await response.json(content_type=None)
+            except Exception:
+                break
+
+            items = data.get("items") if isinstance(data, dict) else None
+            if not items:
+                break
+
+            for item in items:
+                name = str(item.get("name", "")).strip()
+                if not name:
+                    continue
+                lname = name.lower()
+                if lname == query:
+                    GE_SEARCH_CACHE[query] = item
+                    return item
+                if query in lname and best is None:
+                    best = item
+
+    if best:
+        GE_SEARCH_CACHE[query] = best
+    return best
+
+
+def _format_ge_price(value: Any) -> str:
+    if value is None:
+        return "Unknown"
+    return str(value)
+
+
+async def ge_detail_from_id(item_id: int) -> Optional[Dict[str, Any]]:
+    session = await get_http_session()
+    url = f"https://secure.runescape.com/m=itemdb_rs/api/catalogue/detail.json?item={item_id}"
+    try:
+        async with session.get(url) as response:
+            if response.status != 200:
+                return None
+            data = await response.json(content_type=None)
+    except Exception:
+        return None
+    item = data.get("item") if isinstance(data, dict) else None
+    return item if isinstance(item, dict) else None
+
+
+WSID_TASKS = [
+    {"name": "Complete a Treasure Trail", "min_total": 0, "skills": {}, "activity_contains": ["treasure trail"], "tip": "Grab a clue scroll and complete one. Bonus penguin points for dyes."},
+    {"name": "Complete a Quest", "min_total": 0, "skills": {}, "activity_contains": ["quest complete:"], "tip": "Pick one unfinished quest and knock it out."},
+    {"name": "Train Archaeology", "min_total": 0, "skills": {"Archaeology": 5}, "activity_contains": ["archaeology", "dig site", "digsite", "mystery"], "tip": "Restore artefacts, complete a collection, or make progress at a dig site."},
+    {"name": "Kill Queen Black Dragon", "min_total": 1500, "skills": {"Defence": 70, "Ranged": 70}, "activity_contains": ["queen black dragon"], "tip": "A classic bossing task. Bring antifires and dignity."},
+    {"name": "Attempt Fight Kiln", "min_total": 1800, "skills": {"Constitution": 80}, "activity_contains": ["fight kiln", "har'aken"], "tip": "Push for a cape upgrade or just prove the lava floor is optional."},
+    {"name": "Do a Barrows Run", "min_total": 1000, "skills": {"Magic": 50}, "activity_contains": ["barrows"], "tip": "One quick Barrows run. Blame tunnels, not Kyle."},
+    {"name": "Push a 99/110/120 Milestone", "min_total": 1500, "skills": {}, "activity_contains": ["levelled", "xp in"], "tip": "Choose your closest skill milestone and make visible progress."},
+]
+
+
+def _activity_texts(profile: Dict[str, Any]) -> List[str]:
+    activities = profile.get("activities") if isinstance(profile.get("activities"), list) else []
+    return [str(a.get("text", "")).lower() for a in activities if isinstance(a, dict)]
+
+
+def _skill_level_from_profile(profile: Dict[str, Any], skill_name: str) -> int:
+    snapshot = profile_snapshot(profile)
+    skills = snapshot.get("skills", {}) if isinstance(snapshot.get("skills"), dict) else {}
+    return int(skills.get(skill_name, {}).get("level", 0) or 0)
+
+
+def choose_wsid_task(profile: Dict[str, Any], exclude_names: Optional[set[str]] = None) -> Optional[Dict[str, Any]]:
+    exclude_names = exclude_names or set()
+    total = int(profile.get("totalskill", 0) or 0)
+    activity_texts = _activity_texts(profile)
+    candidates = []
+    for task in WSID_TASKS:
+        if task["name"] in exclude_names:
+            continue
+        if total < int(task.get("min_total", 0)):
+            continue
+        if any(_skill_level_from_profile(profile, skill) < level for skill, level in task.get("skills", {}).items()):
+            continue
+        # Recent Adventurer Log only gives recent activity, not true completion state. Avoid recommending
+        # something that appears recently completed, but keep tasks available if not seen recently.
+        if any(any(marker in text for text in activity_texts) for marker in task.get("activity_contains", [])):
+            continue
+        candidates.append(task)
+    if not candidates:
+        candidates = [task for task in WSID_TASKS if task["name"] not in exclude_names]
+    return random.choice(candidates) if candidates else None
+
+
+class WsidView(discord.ui.View):
+    def __init__(self, user_id: int, rsn: str, profile: Dict[str, Any], rejected: Optional[set[str]] = None):
+        super().__init__(timeout=60 * 10)
+        self.user_id = user_id
+        self.rsn = rsn
+        self.profile = profile
+        self.rejected = rejected or set()
+        self.task = choose_wsid_task(profile, self.rejected)
+
+    def build_embed(self) -> discord.Embed:
+        if not self.task:
+            return discord.Embed(title="🎲 What Should I Do?", description="I could not find a suitable task right now.", color=discord.Color.red())
+        embed = discord.Embed(
+            title="🎲 What Should I Do?",
+            description=f"**Suggested task for {self.rsn}:**\n{self.task['name']}\n\n{self.task['tip']}",
+            color=discord.Color.gold(),
+        )
+        embed.set_footer(text="Based on public RuneMetrics data and recent Adventurer Log entries. Full account completion may not be exposed by the API.")
+        return embed
+
+    @discord.ui.button(label="Accept", style=discord.ButtonStyle.success, emoji="✅")
+    async def accept(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message("This task is not yours, noble penguin.", ephemeral=True)
+            return
+        for child in self.children:
+            if isinstance(child, discord.ui.Button):
+                child.disabled = True
+        await interaction.response.edit_message(content="Task accepted. May the drops be purple and Kyle be elsewhere.", embed=self.build_embed(), view=self)
+
+    @discord.ui.button(label="Reroll", style=discord.ButtonStyle.secondary, emoji="🎲")
+    async def reroll(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message("This reroll is not yours, sneaky flipper.", ephemeral=True)
+            return
+        if self.task:
+            self.rejected.add(self.task["name"])
+        self.task = choose_wsid_task(self.profile, self.rejected)
+        await interaction.response.edit_message(embed=self.build_embed(), view=self)
+
+
+@client.tree.command(name="gains", description="Show tracked RuneScape XP gains for a registered player.")
+@app_commands.describe(period="day, week, month, or year", user="Optional registered Discord user")
+@app_commands.choices(period=[
+    app_commands.Choice(name="day", value="day"),
+    app_commands.Choice(name="week", value="week"),
+    app_commands.Choice(name="month", value="month"),
+    app_commands.Choice(name="year", value="year"),
+])
+async def gains(interaction: discord.Interaction, period: app_commands.Choice[str], user: Optional[discord.Member] = None):
+    target = user or interaction.user
+    rsn = RSN_REGISTRATIONS.get(target.id)
+    if not rsn:
+        await interaction.response.send_message("That user has no registered RSN. Use `/rsregister` or ask staff to use `/rsassign`.", ephemeral=True)
+        return
+    seconds = period_to_seconds(period.value)
+    if not seconds:
+        await interaction.response.send_message("Choose day, week, month, or year.", ephemeral=True)
+        return
+    await interaction.response.defer()
+    profile = await fetch_runemetrics_profile(rsn)
+    if not profile:
+        await interaction.followup.send(f"I could not read public RuneMetrics data for **{rsn}**.")
+        return
+    current = profile_snapshot(profile)
+    record_rsn_history_snapshot(target.id, current)
+    baseline = get_history_baseline(target.id, seconds)
+    if not baseline:
+        await interaction.followup.send("No gains history exists yet. Kill Bot will start building it from now.", ephemeral=True)
+        return
+    embed = build_gains_embed(target, rsn, period.value, baseline.get("snapshot", {}), current, int(baseline.get("ts", now_unix_utc())))
+    await interaction.followup.send(embed=embed)
+
+
+@client.tree.command(name="gainz", description="Alias for /gains because penguins respect the z.")
+@app_commands.describe(period="day, week, month, or year", user="Optional registered Discord user")
+@app_commands.choices(period=[
+    app_commands.Choice(name="day", value="day"),
+    app_commands.Choice(name="week", value="week"),
+    app_commands.Choice(name="month", value="month"),
+    app_commands.Choice(name="year", value="year"),
+])
+async def gainz(interaction: discord.Interaction, period: app_commands.Choice[str], user: Optional[discord.Member] = None):
+    await gains.callback(interaction, period, user)  # type: ignore
+
+
+@client.tree.command(name="alog", description="Show a RuneScape player's recent Adventurer Log.")
+@app_commands.describe(rsn="Optional RSN. Defaults to your registered RSN.")
+async def alog(interaction: discord.Interaction, rsn: Optional[str] = None):
+    target_rsn = rsn or RSN_REGISTRATIONS.get(interaction.user.id)
+    if not target_rsn:
+        await interaction.response.send_message("Provide an RSN or register one first with `/rsregister`.", ephemeral=True)
+        return
+    await interaction.response.defer()
+    profile = await fetch_runemetrics_profile(target_rsn)
+    if not profile:
+        await interaction.followup.send(f"Could not read public Adventurer Log data for **{target_rsn}**.", ephemeral=True)
+        return
+    name = profile.get("name", target_rsn)
+    activities = profile.get("activities") if isinstance(profile.get("activities"), list) else []
+    embed = discord.Embed(title=f"📖 Adventurer Log — {name}", color=discord.Color.blurple())
+    if activities:
+        lines = []
+        for activity in activities[:10]:
+            text = str(activity.get("text", "")).strip()
+            date = str(activity.get("date", "")).strip()
+            if text:
+                lines.append(f"• {text}" + (f" — *{date}*" if date else ""))
+        embed.description = "\n".join(lines) if lines else "No recent public Adventurer Log entries found."
+    else:
+        embed.description = "No recent public Adventurer Log entries found."
+    embed.set_footer(text="Data from public RuneMetrics. Private profiles may not show.")
+    await interaction.followup.send(embed=embed)
+
+
+async def send_ge_price(interaction: discord.Interaction, item: str):
+    await interaction.response.defer()
+    found = await ge_itemdb_search(item)
+    if not found:
+        await interaction.followup.send(f"I could not find **{item}** on the RS3 Grand Exchange catalogue.", ephemeral=True)
+        return
+    item_id = int(found.get("id", 0) or 0)
+    detail = await ge_detail_from_id(item_id) if item_id else None
+    data = detail or found
+    name = data.get("name", item)
+    embed = discord.Embed(
+        title=f"💰 GE Price — {name}",
+        description=data.get("description", "RS3 Grand Exchange item."),
+        color=discord.Color.gold(),
+        url=f"https://secure.runescape.com/m=itemdb_rs/objects?id={item_id}" if item_id else None,
+    )
+    current = data.get("current", {}) if isinstance(data.get("current"), dict) else {}
+    today = data.get("today", {}) if isinstance(data.get("today"), dict) else {}
+    embed.add_field(name="Current", value=_format_ge_price(current.get("price")), inline=True)
+    embed.add_field(name="Today", value=f"{today.get('trend', 'unknown')} {_format_ge_price(today.get('price'))}", inline=True)
+    if data.get("icon_large"):
+        embed.set_thumbnail(url=str(data.get("icon_large")))
+    embed.set_footer(text="Source: official RuneScape Grand Exchange itemdb. RS3 only for now.")
+    await interaction.followup.send(embed=embed)
+
+
+@client.tree.command(name="ge", description="Check an RS3 Grand Exchange price.")
+@app_commands.describe(item="Item name, e.g. Praesul codex")
+async def ge(interaction: discord.Interaction, item: str):
+    await send_ge_price(interaction, item)
+
+
+@client.tree.command(name="price", description="Alias for /ge.")
+@app_commands.describe(item="Item name, e.g. Praesul codex")
+async def price(interaction: discord.Interaction, item: str):
+    await send_ge_price(interaction, item)
+
+
+@client.tree.command(name="wsid", description="Suggest a RuneScape task you can do based on your public profile.")
+@app_commands.describe(rsn="Optional RSN. Defaults to your registered RSN.")
+async def wsid(interaction: discord.Interaction, rsn: Optional[str] = None):
+    target_rsn = rsn or RSN_REGISTRATIONS.get(interaction.user.id)
+    if not target_rsn:
+        await interaction.response.send_message("Provide an RSN or register one first with `/rsregister`.", ephemeral=True)
+        return
+    await interaction.response.defer()
+    profile = await fetch_runemetrics_profile(target_rsn)
+    if not profile:
+        await interaction.followup.send(f"Could not read public RuneMetrics data for **{target_rsn}**.", ephemeral=True)
+        return
+    view = WsidView(interaction.user.id, str(profile.get("name", target_rsn)), profile)
+    await interaction.followup.send(embed=view.build_embed(), view=view)
 
 # -----------------------------
 # /rslookup
@@ -3382,6 +4045,24 @@ async def kbcommands(interaction: discord.Interaction):
     )
 
     embed.add_field(
+        name="🛠️ /admindashboard",
+        value=(
+            "Staff only: open the interactive Kill Bot admin dashboard.\n"
+            "**Type:** `/admindashboard`"
+        ),
+        inline=False,
+    )
+
+    embed.add_field(
+        name="🚫 /ignoredrop",
+        value=(
+            "Staff only: add/remove/list drops that should not broadcast.\n"
+            '**Type:** `/ignoredrop action:add item:"shield left half"`'
+        ),
+        inline=False,
+    )
+
+    embed.add_field(
         name="🏓 /ping",
         value="Check that Kill Bot is online and see latency.\n**Type:** `/ping`",
         inline=False,
@@ -3490,6 +4171,30 @@ async def kbcommands(interaction: discord.Interaction):
             "**Type:** `/announce message:<text>`\n"
             "**Example:** `/announce message:Kyle is a noob`"
         ),
+        inline=False,
+    )
+
+    embed.add_field(
+        name="📈 /gains or /gainz",
+        value="Show tracked XP gains for a registered player.\n**Type:** `/gains period:day/week/month/year`",
+        inline=False,
+    )
+
+    embed.add_field(
+        name="📖 /alog",
+        value="Show a player’s recent public Adventurer Log.\n**Type:** `/alog rsn:<optional>`",
+        inline=False,
+    )
+
+    embed.add_field(
+        name="💰 /ge or /price",
+        value="Check an RS3 Grand Exchange price from the official itemdb.\n**Type:** `/ge item:<item name>`",
+        inline=False,
+    )
+
+    embed.add_field(
+        name="🎲 /wsid",
+        value="Suggest something to do based on public RuneMetrics data, with Accept/Reroll buttons.\n**Type:** `/wsid`",
         inline=False,
     )
 
