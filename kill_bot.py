@@ -3984,238 +3984,64 @@ async def lookup(interaction: discord.Interaction, term: str):
 # -----------------------------
 @client.tree.command(name="kbcommands", description="Show Kill Bot commands and how to use them.")
 async def kbcommands(interaction: discord.Interaction):
-    embed = discord.Embed(
-        title="📚 Kill Bot Commands",
-        description="Here be the scroll of incantations. Use these commands as shown:",
-        color=discord.Color.blurple(),
-    )
+    """Show command help split across multiple embeds.
 
-    embed.add_field(
-        name="🎲 /bosspick",
-        value="Pick from multiple bosses → roll → confirm → role board.\n**Type:** `/bosspick`",
-        inline=False,
-    )
+    Discord allows a maximum of 25 fields per embed, so this command deliberately
+    paginates the command list. This prevents HTTP 400 errors as Kill Bot grows.
+    """
+    command_fields = [
+        ("🎲 /bosspick", "Pick from multiple bosses → roll → confirm → role board.\n**Type:** `/bosspick`"),
+        ("⚔️ /pvmtonight", "Post a PVM availability poll. Users click privately and select every boss they are willing to do.\n**Type:** `/pvmtonight`"),
+        ("📯 /gotime", "Collate `/pvmtonight` responses, ignore bosses where interested players exceed max group size, pick from the most selected eligible options, then post a role signup sheet.\n**Type:** `/gotime`"),
+        ("✍️ /updaterole (Staff)", "Assign/remove roles for others on the latest GoTime signup board in the channel.\n**Type:** `/updaterole user:@Someone role:\"Green 2\" action:add/remove`"),
+        ("⏰ /remindme", "Set a reminder for a number of days. Kill Bot will tag you and link back to the original reminder message.\n**Type:** `/remindme days:<number>`\n**Example:** `/remindme days:1`"),
+        ("📊 /poll", "Create a generic reaction poll for any question.\n**Type:** `/poll question:<question> options:<option 1>, <option 2>, <option 3>`"),
+        ("🛠️ /admindashboard", "Staff only: open the interactive Kill Bot admin dashboard.\n**Type:** `/admindashboard`"),
+        ("🚫 /ignoredrop", "Staff only: add/remove/list drops that should not broadcast.\n**Type:** `/ignoredrop action:add item:\"shield left half\"`"),
+        ("🏓 /ping", "Check that Kill Bot is online and see latency.\n**Type:** `/ping`"),
+        ("⏱️ /uptime", "Show how long Kill Bot has been online since the last restart.\n**Type:** `/uptime`"),
+        ("🔄 /updatebot", "Staff only: restart Kill Bot so the host launcher can pull the latest GitHub version.\n**Type:** `/updatebot`\n**Requires:** PC2 must be running via `run_killbot_auto_update.bat`."),
+        ("⚔️ /pk", "Show scoreboard or record a 1v1 PK.\n**Show:** `/pk`\n**Record:** `/pk winner:@Winner loser:@Loser`"),
+        ("🐧 /teampenguin", "Show Team Penguin, or staff can add/remove/clear.\n**Type:** `/teampenguin action:show/add/remove/clear`"),
+        ("📜 /blamekyle", "Generate an official KGP-certified report proving Kyle is responsible.\n**Type:** `/blamekyle` (optional `boss:`)"),
+        ("📜 /blameuser", "Blame any selected user with official KGP authority.\n**Type:** `/blameuser user:@Someone reason:<optional>`"),
+        ("🏅 /rank", "Show your activity points and earnable rank progress.\n**Type:** `/rank` or `/rank user:@Someone`"),
+        ("🏆 /rankboard", "Show the activity points leaderboard.\n**Type:** `/rankboard`"),
+        ("🛠️ /rankadmin (Staff)", "Add, remove, set, or sync activity points.\n**Type:** `/rankadmin user:@Someone action:add/remove/set/sync amount:<number>`"),
+        ("📜 /rsregister", "Register your RuneScape in-game name for RuneMetrics achievement tracking.\n**Type:** `/rsregister rsn:<your RSN>`"),
+        ("🧾 /rsassign (Staff)", "Ice Marshall/Emperor Penguin: assign a RuneScape name to another Discord member for tracking.\n**Type:** `/rsassign user:@Someone rsn:<their RSN>`"),
+        ("📋 /rsregistered", "Show the saved Discord ↔ RSN tracking list. Stored in `rsn_tracking.json`.\n**Type:** `/rsregistered`"),
+        ("🔎 /rschecknow", "Force-check your registered RuneScape profile now.\n**Type:** `/rschecknow`"),
+        ("🧹 /rsunregister", "Remove your registered RuneScape name.\n**Type:** `/rsunregister`"),
+        ("📯 /announce", "Make Kill Bot post a staff announcement. Restricted to Moderator, Ice Marshall, and Emperor Penguin roles.\n**Type:** `/announce message:<text>`"),
+        ("📈 /gains or /gainz", "Show tracked XP gains for a registered player.\n**Type:** `/gains period:day/week/month/year`"),
+        ("📖 /alog", "Show a player’s recent public Adventurer Log.\n**Type:** `/alog rsn:<optional>`"),
+        ("💰 /ge or /price", "Check an RS3 Grand Exchange price from the official itemdb.\n**Type:** `/ge item:<item name>`"),
+        ("🎲 /wsid", "Suggest something to do based on public RuneMetrics data, with Accept/Reroll buttons.\n**Type:** `/wsid`"),
+        ("🔎 /rslookup", "Look up a RuneScape player’s public RuneMetrics profile.\n**Type:** `/rslookup rsn:<player name>`"),
+        ("📚 /lookup", "Look up a RuneScape Wiki term and show a short summary.\n**Type:** `/lookup term:<search>`"),
+        ("📚 /kbcommands", "Show this command list.\n**Type:** `/kbcommands`"),
+    ]
 
-    embed.add_field(
-        name="⚔️ /pvmtonight",
-        value=(
-            "Post a PVM availability poll. Users click privately and select every boss they are willing to do.\n"
-            "**Type:** `/pvmtonight`"
-        ),
-        inline=False,
-    )
-
-    embed.add_field(
-        name="📯 /gotime",
-        value=(
-            "Collate `/pvmtonight` responses, ignore bosses where interested players exceed max group size, "
-            "pick from the most selected eligible options, then post a role signup sheet.\n"
-            "**Type:** `/gotime`"
-        ),
-        inline=False,
-    )
-
-    embed.add_field(
-        name="✍️ /updaterole (Staff)",
-        value=(
-            "Assign/remove roles for others on the latest GoTime signup board in the channel.\n"
-            "**Type:** `/updaterole user:@Someone role:\"Green 2\" action:add/remove`"
-        ),
-        inline=False,
-    )
-
-    embed.add_field(
-        name="⏰ /remindme",
-        value=(
-            "Set a reminder for a number of days. Kill Bot will tag you and link back to the original reminder message.\n"
-            "**Type:** `/remindme days:<number>`\n"
-            "**Example:** `/remindme days:1`"
-        ),
-        inline=False,
-    )
-
-    embed.add_field(
-        name="📊 /poll",
-        value=(
-            "Create a generic reaction poll for any question.\n"
-            "**Type:** `/poll question:<question> options:<option 1>, <option 2>, <option 3>`\n"
-            "**Example:** `/poll question:What should our GIM team name be? options:GIM Noobs, Ultimate Ironmeme, The 5 Legends`"
-        ),
-        inline=False,
-    )
-
-    embed.add_field(
-        name="🛠️ /admindashboard",
-        value=(
-            "Staff only: open the interactive Kill Bot admin dashboard.\n"
-            "**Type:** `/admindashboard`"
-        ),
-        inline=False,
-    )
-
-    embed.add_field(
-        name="🚫 /ignoredrop",
-        value=(
-            "Staff only: add/remove/list drops that should not broadcast.\n"
-            '**Type:** `/ignoredrop action:add item:"shield left half"`'
-        ),
-        inline=False,
-    )
-
-    embed.add_field(
-        name="🏓 /ping",
-        value="Check that Kill Bot is online and see latency.\n**Type:** `/ping`",
-        inline=False,
-    )
-
-    embed.add_field(
-        name="⏱️ /uptime",
-        value="Show how long Kill Bot has been online since the last restart.\n**Type:** `/uptime`",
-        inline=False,
-    )
-
-    embed.add_field(
-        name="🔄 /updatebot",
-        value=(
-            "Staff only: restart Kill Bot so the host launcher can pull the latest GitHub version.\n"
-            "**Type:** `/updatebot`\n"
-            "**Requires:** PC2 must be running via `run_killbot_auto_update.bat`."
-        ),
-        inline=False,
-    )
-
-    embed.add_field(
-        name="⚔️ /pk",
-        value="Show scoreboard or record a 1v1 PK.\n**Show:** `/pk`\n**Record:** `/pk winner:@Winner loser:@Loser`",
-        inline=False,
-    )
-
-    embed.add_field(
-        name="🐧 /teampenguin",
-        value="Show Team Penguin, or Josh can add/remove/clear.\n**Type:** `/teampenguin action:show/add/remove/clear`",
-        inline=False,
-    )
-
-    embed.add_field(
-        name="📜 /blamekyle",
-        value="Generate an official KGP-certified report proving Kyle is responsible.\n**Type:** `/blamekyle` (optional `boss:`)",
-        inline=False,
-    )
-
-    embed.add_field(
-        name="📜 /blameuser",
-        value="Blame any selected user with official KGP authority.\n**Type:** `/blameuser user:@Someone reason:<optional>`",
-        inline=False,
-    )
-
-    embed.add_field(
-        name="🏅 /rank",
-        value="Show your activity points and earnable rank progress.\n**Type:** `/rank` or `/rank user:@Someone`",
-        inline=False,
-    )
-
-    embed.add_field(
-        name="🏆 /rankboard",
-        value="Show the activity points leaderboard.\n**Type:** `/rankboard`",
-        inline=False,
-    )
-
-    embed.add_field(
-        name="🛠️ /rankadmin (Staff)",
-        value="Add, remove, set, or sync activity points.\n**Type:** `/rankadmin user:@Someone action:add/remove/set/sync amount:<number>`",
-        inline=False,
-    )
-
-
-
-    embed.add_field(
-        name="📜 /rsregister",
-        value=(
-            "Register your RuneScape in-game name for RuneMetrics achievement tracking.\n"
-            "**Type:** `/rsregister rsn:<your RSN>`"
-        ),
-        inline=False,
-    )
-
-    embed.add_field(
-        name="🧾 /rsassign (Staff)",
-        value=(
-            "Ice Marshall/Emperor Penguin: assign a RuneScape name to another Discord member for tracking.\n"
-            "**Type:** `/rsassign user:@Someone rsn:<their RSN>`"
-        ),
-        inline=False,
-    )
-
-    embed.add_field(
-        name="📋 /rsregistered",
-        value="Show the saved Discord ↔ RSN tracking list. Stored in `rsn_tracking.json`.\n**Type:** `/rsregistered`",
-        inline=False,
-    )
-
-    embed.add_field(
-        name="🔎 /rschecknow",
-        value="Force-check your registered RuneScape profile now.\n**Type:** `/rschecknow`",
-        inline=False,
-    )
-
-    embed.add_field(
-        name="🧹 /rsunregister",
-        value="Remove your registered RuneScape name.\n**Type:** `/rsunregister`",
-        inline=False,
-    )
-
-    embed.add_field(
-        name="📯 /announce",
-        value=(
-            "Make Kill Bot post a staff announcement. Restricted to Moderator, Ice Marshall, Emperor Penguin, roles.\n"
-            "**Type:** `/announce message:<text>`\n"
-            "**Example:** `/announce message:Kyle is a noob`"
-        ),
-        inline=False,
-    )
-
-    embed.add_field(
-        name="📈 /gains or /gainz",
-        value="Show tracked XP gains for a registered player.\n**Type:** `/gains period:day/week/month/year`",
-        inline=False,
-    )
-
-    embed.add_field(
-        name="📖 /alog",
-        value="Show a player’s recent public Adventurer Log.\n**Type:** `/alog rsn:<optional>`",
-        inline=False,
-    )
-
-    embed.add_field(
-        name="💰 /ge or /price",
-        value="Check an RS3 Grand Exchange price from the official itemdb.\n**Type:** `/ge item:<item name>`",
-        inline=False,
-    )
-
-    embed.add_field(
-        name="🎲 /wsid",
-        value="Suggest something to do based on public RuneMetrics data, with Accept/Reroll buttons.\n**Type:** `/wsid`",
-        inline=False,
-    )
-
-    embed.add_field(
-        name="📚 /lookup",
-        value="Look up a RuneScape Wiki term and show a short summary.\n**Type:** `/lookup term:<search>`",
-        inline=False,
-    )
-
-    embed.add_field(
-        name="📚 /kbcommands",
-        value="Show this command list.\n**Type:** `/kbcommands`",
-        inline=False,
-    )
-
+    fields_per_page = 15
+    pages = [command_fields[i:i + fields_per_page] for i in range(0, len(command_fields), fields_per_page)]
+    embeds: List[discord.Embed] = []
     thumb = bot_thumbnail_url(interaction)
-    if thumb:
-        embed.set_thumbnail(url=thumb)
 
-    embed.set_footer(text="If a command doesn’t appear, check channel permission: Use Application Commands.")
-    await interaction.response.send_message(embed=embed, ephemeral=True)
+    for page_number, page_fields in enumerate(pages, start=1):
+        embed = discord.Embed(
+            title=f"📚 Kill Bot Commands ({page_number}/{len(pages)})",
+            description="Here be the scroll of incantations. Use these commands as shown:",
+            color=discord.Color.blurple(),
+        )
+        for name, value in page_fields:
+            embed.add_field(name=name, value=value, inline=False)
+        if thumb:
+            embed.set_thumbnail(url=thumb)
+        embed.set_footer(text="If a command doesn’t appear, check channel permission: Use Application Commands.")
+        embeds.append(embed)
+
+    await interaction.response.send_message(embeds=embeds, ephemeral=True)
 
 
 # -----------------------------
